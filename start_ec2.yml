@@ -1,0 +1,71 @@
+---
+- name: Start tagged EC2 instances (robust)
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    ansible_python_interpreter: /home/yourusername/ansible-aws-scheduler/venv/bin/python   
+    region: ap-south-1
+    tag_key: AnsibleManaged
+    tag_value: yes
+
+  collections:
+    - amazon.aws
+
+  tasks:
+    - name: Ensure aws cli is available (debug)
+      command: aws --version
+      register: awscli_check
+      failed_when: awscli_check.rc != 0
+      changed_when: false
+
+    - name: Query EC2 instances by tag (Ansible module)
+      amazon.aws.ec2_instance_info:
+        region: "{{ region }}"
+        filters:
+          "tag:{{ tag_key }}": "{{ tag_value }}"
+          
+          "instance-state-name": ["pending","running","stopping","stopped"]
+      register: ec2_info
+      failed_when: ec2_info is failed
+
+    - name: Debug - instances found via ec2_instance_info
+      debug:
+        var: ec2_info.instances
+
+    - name: Build instance_ids list from ec2_info
+      set_fact:
+        instance_ids: "{{ ec2_info.instances | map(attribute='instance_id') | list }}"
+
+    - name: Fallback - use aws cli to get instance ids if none found via module
+      command: >
+        aws ec2 describe-instances
+        --region {{ region }}
+        --filters Name=tag:{{ tag_key }},Values={{ tag_value }}
+        --query "Reservations[].Instances[].InstanceId"
+        --output text
+      register: aws_cli_ids
+      when: instance_ids | length == 0
+      changed_when: false
+
+    - name: Set instance_ids from aws CLI fallback (if used)
+      set_fact:
+        instance_ids: "{{ aws_cli_ids.stdout.split() | default([]) }}"
+      when: aws_cli_ids is defined and aws_cli_ids.stdout != ""
+
+    - name: Final debug - instance_ids to act on
+      debug:
+        var: instance_ids
+
+    - name: Fail if no instances found to start
+      fail:
+        msg: "No EC2 instances found with tag {{ tag_key }}={{ tag_value }} in region {{ region }}"
+      when: instance_ids | length == 0
+
+    - name: Start EC2 instances
+      amazon.aws.ec2_instance:
+        region: "{{ region }}"
+        instance_ids: "{{ instance_ids }}"
+        state: running
+      when: instance_ids | length > 0
